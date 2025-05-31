@@ -1,6 +1,7 @@
 import asyncio
 from typing import Optional
 from contextlib import AsyncExitStack
+import logging
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -10,16 +11,24 @@ from dotenv import load_dotenv
 
 load_dotenv()  # load environment variables from .env
 
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger("mcp-client")
+
 class MCPClient:
+    """
+    MCPClient connects to an MCP server, provides an interactive chat loop,
+    and uses Anthropic's Claude API for natural language queries.
+    """
     def __init__(self):
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.anthropic = Anthropic()
+        self.tools = []
 
     async def connect_to_server(self, server_script_path: str):
-        """Connect to an MCP server
-
+        """
+        Connect to an MCP server and list available tools.
         Args:
             server_script_path: Path to the server script (.py or .js)
         """
@@ -43,11 +52,14 @@ class MCPClient:
 
         # List available tools
         response = await self.session.list_tools()
-        tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+        self.tools = response.tools
+        logger.info(f"Connected to server with tools: {[tool.name for tool in self.tools]}")
+        logger.info("Type your queries or 'quit', 'exit', or press Enter to exit.")
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
+        """
+        Process a query using Claude and available tools.
+        """
         messages = [
             {
                 "role": "user",
@@ -62,17 +74,23 @@ class MCPClient:
             "input_schema": tool.inputSchema
         } for tool in response.tools]
 
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1000,
-            messages=messages,
-            tools=available_tools
-        )
+        try:
+            # Initial Claude API call
+            response = self.anthropic.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1000,
+                messages=messages,
+                tools=available_tools
+            )
+        except Exception as e:
+            if "credit balance is too low" in str(e):
+                return "[Anthropic API error] Your credit balance is too low. Please check your Anthropic account."
+            if "No API key provided" in str(e) or "api_key" in str(e):
+                return "[Anthropic API error] No API key provided. Please set ANTHROPIC_API_KEY in your .env file."
+            return f"[Anthropic API error] {e}"
 
         # Process response and handle tool calls
         final_text = []
-
         assistant_message_content = []
         for content in response.content:
             if content.type == 'text':
@@ -83,8 +101,12 @@ class MCPClient:
                 tool_args = content.input
 
                 # Execute tool call
-                result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                try:
+                    result = await self.session.call_tool(tool_name, tool_args)
+                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                except Exception as tool_e:
+                    final_text.append(f"[Error calling tool {tool_name}: {tool_e}]")
+                    continue
 
                 assistant_message_content.append(content)
                 messages.append({
@@ -103,42 +125,54 @@ class MCPClient:
                 })
 
                 # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1000,
-                    messages=messages,
-                    tools=available_tools
-                )
-
-                final_text.append(response.content[0].text)
+                try:
+                    response = self.anthropic.messages.create(
+                        model="claude-3-5-sonnet-20241022",
+                        max_tokens=1000,
+                        messages=messages,
+                        tools=available_tools
+                    )
+                    final_text.append(response.content[0].text)
+                except Exception as e:
+                    final_text.append(f"[Anthropic API error during tool call: {e}]")
 
         return "\n".join(final_text)
 
     async def chat_loop(self):
-        """Run an interactive chat loop"""
-        print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
+        """
+        Run an interactive chat loop. Type 'quit', 'exit', or press Enter to exit.
+        """
+        logger.info("MCP Client Started!")
+        logger.info(f"Available tools: {[tool.name for tool in self.tools]}")
+        logger.info("Type your queries or 'quit', 'exit', or press Enter to exit.")
 
         while True:
             try:
                 query = input("\nQuery: ").strip()
-
-                if query.lower() == 'quit':
+                if query.lower() in ('quit', 'exit') or query == '':
+                    logger.info("Exiting chat loop.")
                     break
-
                 response = await self.process_query(query)
                 print("\n" + response)
-
+            except KeyboardInterrupt:
+                logger.info("KeyboardInterrupt received. Exiting chat loop.")
+                break
             except Exception as e:
-                print(f"\nError: {str(e)}")
+                logger.error(f"Error: {str(e)}")
 
     async def cleanup(self):
-        """Clean up resources"""
+        """
+        Clean up resources.
+        """
         await self.exit_stack.aclose()
 
 async def main():
+    """
+    Entry point for the MCP client. Connects to the server and starts the chat loop.
+    """
+    import sys
     if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_server_script>")
+        logger.error("Usage: python client.py <path_to_server_script>")
         sys.exit(1)
 
     client = MCPClient()
@@ -149,5 +183,4 @@ async def main():
         await client.cleanup()
 
 if __name__ == "__main__":
-    import sys
     asyncio.run(main())
